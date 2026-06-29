@@ -1,4 +1,4 @@
-# azure.privatedns
+# azure-private-dns
 
 PowerShell toolkit for bridging Azure Private DNS zones to on-premises DNS infrastructure, and for keeping route tables in sync with private endpoints.
 
