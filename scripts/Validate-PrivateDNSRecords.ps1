@@ -1,42 +1,83 @@
-#usage
-#.\Check-PrivateDNSRecords.ps1 -csvPath "c:\temp\pdns.csv"
+<#
+.SYNOPSIS
+    Validates that DNS records in the CSV resolve to the expected IP addresses.
 
-param
-(
-    [Parameter(Mandatory = $true)]
-    [string]$csvPath
+.DESCRIPTION
+    Reads the CSV produced by Export-PrivateDNSRecords.ps1 and checks that each record
+    resolves to its expected IP via public DNS (which returns CNAMEs for privatelink zones)
+    or via the local DNS resolver.
+
+    For privatelink zones, the public DNS name is constructed by stripping the 'privatelink.'
+    prefix from the zone name.
+
+.PARAMETER CsvPath
+    Path to the CSV file produced by Export-PrivateDNSRecords.ps1.
+
+.PARAMETER DnsServer
+    Optional DNS server to query. Defaults to the system resolver.
+
+.EXAMPLE
+    .\Validate-PrivateDNSRecords.ps1 -CsvPath 'C:\temp\pdns.csv'
+
+.EXAMPLE
+    .\Validate-PrivateDNSRecords.ps1 -CsvPath 'C:\temp\pdns.csv' -DnsServer '10.0.0.4' -Verbose
+#>
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path $_ })]
+    [string] $CsvPath,
+
+    [string] $DnsServer
 )
 
-# Import the CSV
-Write-output "Importing CSV"
-$csv = Import-Csv -Path $csvPath
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Check the DNS Records from CSV
-Write-output "Checking DNS Records resolve to IP Address in CSV"
+Write-Verbose "Importing records from '$CsvPath'..."
+$records = Import-Csv -Path $CsvPath
 
-foreach ($record in $csv)
-{
-    $recordName = $record.Name
-    $recordValue = $record.Value
-    $recordZone = $record.Zone
+$results = foreach ($record in $records) {
+    $zone  = $record.Zone
+    $name  = $record.Name
+    $ip    = $record.Value
 
-    if ($recordZone -eq "privatelink.vaultcore.azure.net")
-    {
-        $recordZone = "vault.azure.net"
+    # Strip 'privatelink.' prefix to get the public FQDN
+    $publicZone = $zone -replace '^privatelink\.', ''
+    $fqdn = '{0}.{1}' -f $name, $publicZone
+
+    try {
+        $resolveParams = @{ Name = $fqdn; ErrorAction = 'Stop' }
+        if ($DnsServer) { $resolveParams['Server'] = $DnsServer }
+
+        $resolved = Resolve-DnsName @resolveParams
+        $resolvedIps = $resolved | Where-Object { $_.Type -eq 'A' } | Select-Object -ExpandProperty IPAddress
+
+        if ($resolvedIps -contains $ip) {
+            $status = 'PASS'
+        }
+        elseif ($resolvedIps) {
+            $status = 'MISMATCH'
+        }
+        else {
+            $status = 'NO_A_RECORD'
+        }
     }
-    elseif ($recordZone -ne "privatelink.adf.azure.com" -and $recordZone -ne "privatelink.purviewstudio.azure.com" -and $recordName -notlike "*ab-pod01*")
-    {
-        $recordZone = $recordZone.Replace("privatelink.", "")
+    catch {
+        $resolvedIps = @()
+        $status = 'FAIL'
     }
 
-    $dnsRecord = Resolve-DnsName -Name "$recordName.$recordZone"
-
-    if ($dnsRecord.IPAddress -contains $recordValue)
-    {
-        Write-Host "DNS Record $recordName.$recordZone resolves to $recordValue" -ForegroundColor Green
-    }
-    else
-    {
-        Write-Host "DNS Record $recordName.$recordZone does not resolve to $recordValue" -ForegroundColor Red
+    [PSCustomObject]@{
+        Status      = $status
+        FQDN        = $fqdn
+        ExpectedIP  = $ip
+        ResolvedIPs = $resolvedIps -join ', '
     }
 }
+
+$results | Format-Table -AutoSize
+
+$pass    = ($results | Where-Object Status -eq 'PASS').Count
+$fail    = ($results | Where-Object Status -in 'FAIL','NO_A_RECORD','MISMATCH').Count
+Write-Host "`nResults — Pass: $pass  Fail: $fail  Total: $($results.Count)"

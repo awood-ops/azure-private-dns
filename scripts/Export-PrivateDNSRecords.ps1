@@ -1,67 +1,77 @@
-#usage
-#.\Export-PrivateDNSRecords.ps1 -privateDnsSubscriptionId "00000000-0000-0000-0000-000000000000" -csvPath "c:\temp\pdns.csv"
+#Requires -Modules Az.PrivateDns, Az.Accounts
+<#
+.SYNOPSIS
+    Exports all Azure Private DNS A records from a subscription to a CSV file.
 
-param
-(
-    [Parameter(Mandatory = $true)]
-    [string]$privateDnsSubscriptionId,
-    [Parameter(Mandatory = $true)]
-    [string]$csvPath
+.DESCRIPTION
+    Connects to an Azure subscription, retrieves all Private DNS zones and their A records,
+    and exports them to a CSV file for use with Import-PrivateDNSRecords.ps1.
+
+    Assumes an existing Az context (run Connect-AzAccount before invoking this script).
+
+.PARAMETER SubscriptionId
+    The ID of the Azure subscription containing the Private DNS zones.
+
+.PARAMETER CsvPath
+    Output path for the CSV file. Must not already exist unless -Force is specified.
+
+.PARAMETER Force
+    Overwrite the CSV file if it already exists.
+
+.EXAMPLE
+    .\Export-PrivateDNSRecords.ps1 -SubscriptionId '00000000-0000-0000-0000-000000000000' -CsvPath 'C:\temp\pdns.csv'
+
+.EXAMPLE
+    .\Export-PrivateDNSRecords.ps1 -SubscriptionId '00000000-0000-0000-0000-000000000000' -CsvPath 'C:\temp\pdns.csv' -Force
+#>
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)]
+    [string] $SubscriptionId,
+
+    [Parameter(Mandatory)]
+    [string] $CsvPath,
+
+    [switch] $Force
 )
 
-# Check if the CSV file already exists
-if (Test-Path $csvPath) {
-    Write-Error "The CSV file '$csvPath' already exists. Please specify a different file path or remove file and try again."
-    return
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+# Verify Az context
+if (-not (Get-AzContext)) {
+    throw 'No Azure context found. Run Connect-AzAccount before invoking this script.'
 }
 
-# Authenticate to Azure
-Write-Output "Authenticating to Azure..."
-Connect-AzAccount
+if ((Test-Path $CsvPath) -and -not $Force) {
+    throw "Output file '$CsvPath' already exists. Use -Force to overwrite."
+}
 
-#Get the Azure subscription name
-$subscriptionName = (Get-AzSubscription -SubscriptionId $privateDnsSubscriptionId).Name
+Write-Verbose "Setting subscription context to '$SubscriptionId'..."
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
-# Set the Azure subscription context
-Write-Output "Setting Azure subscription context to '$subscriptionName'..."
-Set-AzContext -SubscriptionId $privateDnsSubscriptionId
+Write-Verbose 'Retrieving Private DNS zones...'
+$zones = Get-AzPrivateDnsZone
 
-# Get all Private DNS zones in the subscription
-Write-Output "Getting all Private DNS zones in the subscription..."
-$privateDnsZones = Get-AzPrivateDnsZone
+$records = foreach ($zone in $zones) {
+    Write-Verbose "  Processing zone '$($zone.Name)'..."
+    $recordSets = Get-AzPrivateDnsRecordSet -ZoneName $zone.Name -ResourceGroupName $zone.ResourceGroupName
 
-# Create an array to store the DNS records
-Write-Output "Creating an array to store the DNS records..."
-$dnsRecords = @()
-
-# Loop through each Private DNS zone
-foreach ($privateDnsZone in $privateDnsZones) {
-    # Get the Private DNS zone records
-    Write-Output "Getting Private DNS zone records for zone '$($privateDnsZone.Name)'..."
-    $privateDnsZoneRecords = Get-AzPrivateDnsRecordSet -ZoneName $privateDnsZone.Name -ResourceGroupName $privateDnsZone.ResourceGroupName
-
-    # Loop through each Private DNS zone record
-    foreach ($privateDnsZoneRecord in $privateDnsZoneRecords) {
-        # Check if the Private DNS zone record is an A record
-        if ($privateDnsZoneRecord.RecordType -eq 'A') {
-            # Create a new DNS record object
-            Write-Output "Creating a new DNS record object for record '$($privateDnsZoneRecord.Name)' in zone '$($privateDnsZoneRecord.ZoneName)'..."
-            $dnsRecord = [PSCustomObject]@{
-                Name = $privateDnsZoneRecord.Name
-                Zone = $privateDnsZoneRecord.ZoneName
-                Type = $privateDnsZoneRecord.RecordType
-                Value = $privateDnsZoneRecord.records.ipv4address
+    foreach ($rs in $recordSets) {
+        if ($rs.RecordType -eq 'A') {
+            foreach ($record in $rs.Records) {
+                [PSCustomObject]@{
+                    Zone  = $zone.Name
+                    Name  = $rs.Name
+                    Value = $record.Ipv4Address
+                }
             }
-
-            # Add the DNS record object to the array
-            Write-Output "Adding the DNS record object to the array..."
-            $dnsRecords += $dnsRecord
         }
     }
 }
 
-# Export the DNS records to a CSV file
-Write-Output "Exporting the DNS records to CSV file '$csvPath'..."
-$dnsRecords | Export-Csv -Path $csvPath -NoTypeInformation
+$count = ($records | Measure-Object).Count
+Write-Verbose "Exporting $count record(s) to '$CsvPath'..."
+$records | Export-Csv -Path $CsvPath -NoTypeInformation -Force:$Force
 
-Write-Output "Done."
+Write-Host "Exported $count Private DNS A record(s) to '$CsvPath'."
