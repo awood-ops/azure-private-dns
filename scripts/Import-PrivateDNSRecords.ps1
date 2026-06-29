@@ -1,64 +1,81 @@
-#usage
-#.\Import-PrivateDNSRecords.ps1 -dnsServerName "dnssrv01" -csvPath "c:\temp\pdns.csv"
+#Requires -Modules DnsServer
+<#
+.SYNOPSIS
+    Imports Private DNS records from a CSV into a Windows DNS server.
 
-param
-(
-    [Parameter(Mandatory = $true)]
-    [string]$dnsServerName,
-    [Parameter(Mandatory = $true)]
-    [string]$csvPath
+.DESCRIPTION
+    Reads the CSV produced by Export-PrivateDNSRecords.ps1 and creates the corresponding
+    Forward Lookup Zones and A records on a Windows DNS server. Idempotent — skips zones
+    and records that already exist.
+
+    Requires the DnsServer PowerShell module (RSAT: DNS Server Tools).
+
+.PARAMETER DnsServerName
+    Name or IP address of the Windows DNS server to import records into.
+
+.PARAMETER CsvPath
+    Path to the CSV file produced by Export-PrivateDNSRecords.ps1.
+
+.EXAMPLE
+    .\Import-PrivateDNSRecords.ps1 -DnsServerName 'dns01' -CsvPath 'C:\temp\pdns.csv'
+#>
+[CmdletBinding(SupportsShouldProcess)]
+param (
+    [Parameter(Mandatory)]
+    [string] $DnsServerName,
+
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path $_ })]
+    [string] $CsvPath
 )
 
-# Import the DNS records from the CSV file
-Write-Output "Importing DNS records from CSV file..."
-$dnsRecords = Import-Csv -Path $csvPath
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Loop through each DNS record
-foreach ($dnsRecord in $dnsRecords) {
-    # Get the DNS zone
-    Write-Output "Getting DNS zone '$($dnsRecord.Zone)'..."
-    $dnsZone = Get-DnsServerZone -Name $dnsRecord.Zone -ErrorAction SilentlyContinue
+Write-Verbose "Importing records from '$CsvPath'..."
+$records = Import-Csv -Path $CsvPath
 
-    # Check if the DNS zone exists
-    if (!$dnsZone) {
-        # Create the DNS zone
-        Write-Output "DNS zone '$($dnsRecord.Zone)' does not exist. Creating zone..."
-        Add-DnsServerPrimaryZone -Name $dnsRecord.Zone -DynamicUpdate Secure -ReplicationScope Forest
-    }
+$created = 0
+$skipped = 0
+$errors  = 0
 
-    # Check if the A record already exists
-    Write-Output "Checking if A record '$($dnsRecord.Name)' already exists in zone '$($dnsRecord.Zone)'..."
-    $aRecordExists = Get-DnsServerResourceRecord -ZoneName $dnsRecord.Zone -Name $dnsRecord.Name -RRType A -ErrorAction SilentlyContinue
+foreach ($record in $records) {
+    $zone = $record.Zone
+    $name = $record.Name
+    $ip   = $record.Value
 
-    if ($aRecordExists) {
-        # The A record already exists, so compare the IP address
-        Write-Output "A record '$($dnsRecord.Name)' already exists in zone '$($dnsRecord.Zone)'. Comparing IP addresses..."
-        $existingRecord = Get-DnsServerResourceRecord -ZoneName $dnsRecord.Zone -Name $dnsRecord.Name -RRType A
-        if ($existingRecord.RecordData.IPv4Address -ne $dnsRecord.Value) {
-            # The IP address is different, so warn the user
-            Write-Warning "IP address for A record '$($dnsRecord.Name)' in zone '$($dnsRecord.Zone)' is different from the CSV file. Existing IP address: $($existingRecord.RecordData.IPv4Address). New IP address: $($dnsRecord.Value)."
+    try {
+        # Create the Forward Lookup Zone if it doesn't exist
+        $existingZone = Get-DnsServerZone -ComputerName $DnsServerName -Name $zone -ErrorAction SilentlyContinue
+        if (-not $existingZone) {
+            if ($PSCmdlet.ShouldProcess($DnsServerName, "Create zone '$zone'")) {
+                Add-DnsServerPrimaryZone -ComputerName $DnsServerName -Name $zone -ReplicationScope 'Forest'
+                Write-Verbose "  Created zone '$zone'."
+            }
+        }
+
+        # Check for duplicate IP or name before creating
+        $existingRecords = Get-DnsServerResourceRecord -ComputerName $DnsServerName -ZoneName $zone -RRType A -ErrorAction SilentlyContinue
+        $duplicate = $existingRecords | Where-Object {
+            $_.HostName -eq $name -or $_.RecordData.IPv4Address.IPAddressToString -eq $ip
+        }
+
+        if ($duplicate) {
+            Write-Verbose "  Skipping '$name' in '$zone' — record already exists."
+            $skipped++
         }
         else {
-            # The IP address is the same, so skip adding the record
-            Write-Warning "A record '$($dnsRecord.Name)' already exists in zone '$($dnsRecord.Zone)' with the same IP address. Skipping record creation for $($dnsRecord.Name)."
+            if ($PSCmdlet.ShouldProcess($DnsServerName, "Add A record '$name' ($ip) in zone '$zone'")) {
+                Add-DnsServerResourceRecordA -ComputerName $DnsServerName -ZoneName $zone -Name $name -IPv4Address $ip
+                Write-Verbose "  Created A record '$name' ($ip) in zone '$zone'."
+                $created++
+            }
         }
     }
-    else {
-        # Check if the IP address is already in use
-        Write-Output "Checking if IP address '$($dnsRecord.Value)' is already in use..."
-        $ipExists = Get-DnsServerResourceRecord -ZoneName $dnsRecord.Zone -RRType A -ErrorAction SilentlyContinue | Where-Object {$_.RecordData.IPv4Address -eq $dnsRecord.Value}
-
-        if ($ipExists) {
-            # The IP address is already in use, so skip adding the record
-            Write-Warning "IP address '$($dnsRecord.Value)' is already in use in zone '$($dnsRecord.Zone)'. Skipping record creation for $($dnsRecord.Name)."
-        }
-        else {
-            # Add the DNS A record to the DNS zone
-            Write-Output "Adding DNS A record '$($dnsRecord.Name)' with value '$($dnsRecord.Value)' to zone '$($dnsRecord.Zone)'..."
-            Add-DnsServerResourceRecordA -Name $dnsRecord.Name -IPv4Address $dnsRecord.Value -ZoneName $dnsRecord.Zone -ComputerName $dnsServerName
-
-            # Wait for 5 seconds before processing the next record
-            Start-Sleep -Seconds 5
-        }
+    catch {
+        Write-Warning "  Failed to process '$name' in '$zone': $_"
+        $errors++
     }
 }
+
+Write-Host "Import complete — Created: $created  Skipped: $skipped  Errors: $errors"

@@ -1,70 +1,117 @@
-#### Written by: Andrew Wood
-#### Date: 2023-08-18
-#### Purpose: This script will create a route in a route table for each Private Endpoint in the subscription. The route will be a /32 route to the Private Endpoint's IP address, and the route name will be the Private Endpoint's DNS name. This script is intended to be run on a schedule, such as once per day, to ensure that the route table is kept up to date with any new Private Endpoints that have been created since the last time the script was run.
-#### Usage: .\Create-PrivateEndpointRoutes.ps1 -subscriptionName "My Subscription" -routetableresourceGroupName "My Route Table Resource Group" -routeTableName "My Route Table"
+#Requires -Modules Az.PrivateDns, Az.Network, Az.Accounts
+<#
+.SYNOPSIS
+    Creates /32 routes in an Azure Route Table for each Private Endpoint in a subscription.
 
+.DESCRIPTION
+    Enumerates all Private DNS A records across the subscription and ensures a corresponding
+    /32 host route exists in the target Route Table, directing traffic to a next-hop IP
+    (typically a firewall or NVA).
 
-param(
-    [Parameter(Mandatory=$true)]
-    [string]$subscriptionName,
-    [Parameter(Mandatory=$true)]
-    [string]$routetableresourceGroupName,
-    [Parameter(Mandatory=$true)]
-    [string]$routeTableName,
-    [Parameter(Mandatory=$true)]
-    [string]$nextHopIpAddress
+    Designed to run on a schedule (e.g. daily) to keep the Route Table in sync as new
+    Private Endpoints are provisioned. Idempotent — skips routes that already exist.
+
+    Assumes an existing Az context (run Connect-AzAccount before invoking this script).
+
+.PARAMETER SubscriptionId
+    The ID of the Azure subscription to enumerate Private DNS zones from.
+
+.PARAMETER RouteTableResourceGroupName
+    Resource group containing the target Route Table.
+
+.PARAMETER RouteTableName
+    Name of the Route Table to update.
+
+.PARAMETER NextHopIpAddress
+    IP address of the next hop (firewall or NVA) for the /32 routes.
+
+.EXAMPLE
+    .\Create-PrivateEndpointRoutes.ps1 `
+        -SubscriptionId '00000000-0000-0000-0000-000000000000' `
+        -RouteTableResourceGroupName 'rg-networking' `
+        -RouteTableName 'rt-hub' `
+        -NextHopIpAddress '10.0.0.4'
+#>
+[CmdletBinding(SupportsShouldProcess)]
+param (
+    [Parameter(Mandatory)]
+    [string] $SubscriptionId,
+
+    [Parameter(Mandatory)]
+    [string] $RouteTableResourceGroupName,
+
+    [Parameter(Mandatory)]
+    [string] $RouteTableName,
+
+    [Parameter(Mandatory)]
+    [string] $NextHopIpAddress
 )
 
-# Authenticate to Azure
-Write-Output "Authenticating to Azure..."
-Connect-AzAccount
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Set the Azure subscription context
-Write-Output "Setting Azure subscription context to '$subscriptionName'..."
-Set-AzContext -SubscriptionName $subscriptionName
+# Verify Az context
+if (-not (Get-AzContext)) {
+    throw 'No Azure context found. Run Connect-AzAccount before invoking this script.'
+}
 
-# Get all Private DNS zones in the subscription
-Write-Output "Getting all Private DNS zones in the subscription..."
-$privateDnsZones = Get-AzPrivateDnsZone
+Write-Verbose "Setting subscription context to '$SubscriptionId'..."
+Set-AzContext -SubscriptionId $SubscriptionId | Out-Null
 
-# Create an array to store the IPv4 addresses and DNS names
-Write-Output "Creating an array to store the IPv4 addresses and DNS names..."
-$ipv4AddressesAndNames = @()
+Write-Verbose 'Retrieving Private DNS zones...'
+$zones = Get-AzPrivateDnsZone
 
-# Loop through each Private DNS zone
-foreach ($privateDnsZone in $privateDnsZones) {
-    # Get the Private DNS zone records
-    Write-Output "Getting Private DNS zone records for zone '$($privateDnsZone.Name)'..."
-    $privateDnsZoneRecords = Get-AzPrivateDnsRecordSet -ZoneName $privateDnsZone.Name -ResourceGroupName $privateDnsZone.ResourceGroupName
+# Build list of endpoint IPs and generated route names
+$endpoints = foreach ($zone in $zones) {
+    Write-Verbose "  Processing zone '$($zone.Name)'..."
+    $recordSets = Get-AzPrivateDnsRecordSet -ZoneName $zone.Name -ResourceGroupName $zone.ResourceGroupName
 
-    # Loop through each Private DNS zone record
-    foreach ($privateDnsZoneRecord in $privateDnsZoneRecords) {
-        # Check if the Private DNS zone record is an A record
-        if ($privateDnsZoneRecord.RecordType -eq 'A') {
-            # Add the IPv4 address and DNS name to the array
-            $dnsName = "pe-" + $privateDnsZoneRecord.Name.Replace(".", "") + "-" + $privateDnsZone.name
-            Write-Output "Adding IPv4 address '$($privateDnsZoneRecord.records.ipv4address)' and DNS name '$dnsName' to the array..."
-            $ipv4AddressesAndNames += @{ipv4Address=$privateDnsZoneRecord.records.ipv4address; dnsName=$dnsName}
+    foreach ($rs in $recordSets) {
+        if ($rs.RecordType -eq 'A') {
+            foreach ($record in $rs.Records) {
+                $routeName = 'pe-{0}-{1}' -f ($rs.Name -replace '\.', ''), $zone.Name
+                if ($routeName.Length -gt 80) { $routeName = $routeName.Substring(0, 80) }
+
+                [PSCustomObject]@{
+                    RouteName = $routeName
+                    IpAddress = $record.Ipv4Address
+                    Zone      = $zone.Name
+                    Name      = $rs.Name
+                }
+            }
         }
     }
 }
 
-# Get the existing route table
-Write-Output "Getting the existing route table '$routeTableName'..."
-$routeTable = Get-AzRouteTable -Name $routeTableName -ResourceGroupName $routetableresourceGroupName
+Write-Verbose "Getting Route Table '$RouteTableName'..."
+$routeTable = Get-AzRouteTable -Name $RouteTableName -ResourceGroupName $RouteTableResourceGroupName
+$existingRouteNames = $routeTable.Routes | Select-Object -ExpandProperty Name
 
-# Loop through each IPv4 address and create a route for it as a /32 in the route table, using the DNS name as the route config name
-foreach ($ipv4AddressAndName in $ipv4AddressesAndNames) {
-    $routeConfig = Get-AzRouteConfig -Name $ipv4AddressAndName.dnsName -RouteTable $routeTable -ErrorAction SilentlyContinue
-    if ($routeConfig -eq $null) {
-        Write-Output "Creating route for DNS name '$($ipv4AddressAndName.dnsName)' and IPv4 address '$($ipv4AddressAndName.ipv4Address)' in route table '$routeTableName'..."
-        Add-AzRouteConfig -Name $ipv4AddressAndName.dnsName -AddressPrefix "$($ipv4AddressAndName.ipv4Address)/32" -NextHopType VirtualAppliance -NextHopIpAddress $nextHopIpAddress -RouteTable $routeTable
+$created = 0
+$skipped = 0
+
+foreach ($ep in $endpoints) {
+    if ($existingRouteNames -contains $ep.RouteName) {
+        Write-Verbose "  Skipping '$($ep.RouteName)' — route already exists."
+        $skipped++
+        continue
     }
-    else {
-        Write-Output "Route for DNS name '$($ipv4AddressAndName.dnsName)' already exists in route table '$routeTableName'. Skipping..."
+
+    if ($PSCmdlet.ShouldProcess($RouteTableName, "Add route '$($ep.RouteName)' → $($ep.IpAddress)/32 via $NextHopIpAddress")) {
+        Add-AzRouteConfig `
+            -Name            $ep.RouteName `
+            -AddressPrefix   "$($ep.IpAddress)/32" `
+            -NextHopType     VirtualAppliance `
+            -NextHopIpAddress $NextHopIpAddress `
+            -RouteTable      $routeTable | Out-Null
+        $created++
+        Write-Verbose "  Added route '$($ep.RouteName)'."
     }
 }
 
-Set-AzRouteTable -RouteTable $routeTable
+if ($created -gt 0) {
+    Write-Verbose 'Committing Route Table changes...'
+    Set-AzRouteTable -RouteTable $routeTable | Out-Null
+}
 
-Write-Output "Done."
+Write-Host "Route update complete — Created: $created  Skipped: $skipped  Total endpoints: $($endpoints.Count)"

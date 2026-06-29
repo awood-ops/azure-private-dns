@@ -1,129 +1,167 @@
-# Azure Private DNS Export/Import
+# azure-private-dns
 
-This repo has been created to simplify the export of Private DNS Zones from Azure and to import them into an On-Premise DNS Infrastructure
+PowerShell toolkit for bridging Azure Private DNS zones to on-premises DNS infrastructure, and for keeping route tables in sync with private endpoints.
 
+## Overview
 
-## Export-PrivateDNSRecords.ps1
+When Azure Private Endpoints are used in a hybrid network, on-premises clients need matching A records in their local DNS to resolve private link addresses. This toolkit automates the export, import, validation, and connectivity testing of those records — and optionally keeps an Azure Route Table up to date with /32 host routes for each endpoint.
 
-This PowerShell script exports all Azure Private DNS records from an Azure Subscription to a CSV file.
+```mermaid
+flowchart LR
+    A[Azure\nPrivate DNS Zones] -->|Export-PrivateDNSRecords| B[(CSV File)]
+    B -->|Import-PrivateDNSRecords| C[On-Prem\nDNS Server]
+    B -->|Validate-PrivateDNSRecords| D{DNS resolves\ncorrectly?}
+    B -->|Test-PrivateDNSConnectivity| E{TCP port\nreachable?}
+    A -->|Create-PrivateEndpointRoutes| F[Azure\nRoute Table]
 
-### Usage
-
-The script will first authenticate with your Azure login credentials. The parameter `-privateDnsSubscriptionId` sets the subscription where all your Azure Private DNS Zones are held, the `-csvPath` parameter sets where the csv export will be
-
-```powershell
-.\scripts\Export-PrivateDNSRecords.ps1 -privateDnsSubscriptionId "00000000-0000-0000-0000-000000000000" -csvPath "c:\temp\pdns.csv"
+    style A fill:#0072C6,color:#fff
+    style C fill:#2E7D32,color:#fff
+    style F fill:#0072C6,color:#fff
 ```
 
-**Parameters**
+## Prerequisites
 
-The following Parameters are required:
+- PowerShell 7+
+- `Az.Accounts`, `Az.PrivateDns`, `Az.Network` modules (for Azure scripts):
+  ```powershell
+  Install-Module Az -Scope CurrentUser
+  ```
+- `DnsServer` RSAT module (for `Import-PrivateDNSRecords.ps1`, Windows only):
+  ```powershell
+  Add-WindowsCapability -Online -Name Rsat.Dns.Tools~~~~0.0.1.0
+  ```
+- An active Azure context before running any Az scripts:
+  ```powershell
+  Connect-AzAccount
+  ```
 
+## Scripts
 
-**privateDnsSubscriptionId**: The ID of the Azure subscription containing the Private DNS zones
+### Export-PrivateDNSRecords.ps1
 
-
-**csvPath**: The path to the CSV file to export the DNS records to
-
-
-**Output**
-
-The script exports the following fields for each DNS record:
-
-**ZoneName**: The name of the Private DNS zone
-
-**Name**: The name of the DNS record
-
-**Value**: The IP address of the DNS record
-
-The CSV file can be opened in Microsoft Excel or another spreadsheet program
-
-**Output**
-
-The script creates a csv ready for import into a DNS server
-
-
-## Import-PrivateDNSRecords.ps1
-
-This PowerShell script imports Azure Private DNS records and creates Forward Lookup Zones from a CSV file
-
-### Usage
-
-To use the script ensure you have line of sight to the DNS server and permissions to write to the DNS Server. Then, run the script with the `-dnsServerName` and `-csvPath` parameters
-The script will check if the Forward Lookup Zone has been created for the records and if it hasn't it will create them, it will then check if the IP has been used for the A record and then check the A record name, if neither of these have been created it will proceed to create the record. If not, you will receive an error advising to check these and the records won't be created
+Exports all Private DNS A records from an Azure subscription to a CSV file.
 
 ```powershell
-.\scripts\Import-PrivateDNSRecords.ps1 -dnsServerName "dns01" -csvPath "c:\temp\pdns.csv"
+.\scripts\Export-PrivateDNSRecords.ps1 `
+    -SubscriptionId '00000000-0000-0000-0000-000000000000' `
+    -CsvPath 'C:\temp\pdns.csv'
 ```
 
-**Parameters**
+| Parameter | Required | Description |
+|---|---|---|
+| `SubscriptionId` | Yes | Azure subscription ID containing the Private DNS zones |
+| `CsvPath` | Yes | Output CSV file path |
+| `Force` | No | Overwrite the CSV if it already exists |
 
-The following Parameters are required:
+**Output CSV columns:** `Zone`, `Name`, `Value` (IP address)
 
+---
 
-**dnsServerName**: The name of the DNS server to add the DNS records to.
+### Import-PrivateDNSRecords.ps1
 
-
-**csvPath**: The path to the CSV file containing the DNS records to import.
-
-
-**CSV File Format**
-
-___
-
-
-
-The CSV file should contain the following columns:
-
-**Zone**: The name of the Private DNS zone.
-
-
-**Name**: The name of the DNS record.
-
-
-**Value**: The IP address of the DNS record.
-
-
-
-Output
-The script adds the DNS records to the specified DNS server.
-
-## Validate-PrivateDNSRecords.ps1
-
-This PowerShell script checks the Azure Private DNS records against your DNS Server from the records in the CSV file
-
-### Usage
-
-To use the script, ensure the `-csvPath` parameter is filled with the location of the CSV File.
-
-The script will then run a check against your DNS server for the public DNS records of the private link records in the CSV file, if you have Private DNS setup in Azure then the public DNS will show a CNAME record for the private link address. If you have utilised the Export/Import process in this repo, you will have configured the Forward Lookup Zones with the relevant A records that relate to the private link addresses.
+Reads the exported CSV and creates the corresponding Forward Lookup Zones and A records on a Windows DNS server. Idempotent — skips zones and records that already exist.
 
 ```powershell
-.\scripts\Validate-PrivateDNSRecords.ps1 -csvPath "c:\temp\pdns.csv"
+.\scripts\Import-PrivateDNSRecords.ps1 `
+    -DnsServerName 'dns01' `
+    -CsvPath 'C:\temp\pdns.csv'
 ```
 
-**Parameters**
+| Parameter | Required | Description |
+|---|---|---|
+| `DnsServerName` | Yes | Hostname or IP of the Windows DNS server |
+| `CsvPath` | Yes | Path to the CSV produced by the export script |
 
-**csvPath**: The path to the CSV file containing the DNS records to import
+Supports `-WhatIf` to preview changes without applying them.
 
-**CSV File Format**
+---
 
-___
+### Validate-PrivateDNSRecords.ps1
 
+Checks that each record in the CSV resolves to its expected IP address. Strips the `privatelink.` prefix to construct the public FQDN used for resolution.
 
+```powershell
+# Validate using system resolver
+.\scripts\Validate-PrivateDNSRecords.ps1 -CsvPath 'C:\temp\pdns.csv'
 
-The CSV file should contain the following columns:
+# Validate via a specific DNS server
+.\scripts\Validate-PrivateDNSRecords.ps1 -CsvPath 'C:\temp\pdns.csv' -DnsServer '10.0.0.4'
+```
 
-**Zone**: The name of the Private DNS zone.
+| Parameter | Required | Description |
+|---|---|---|
+| `CsvPath` | Yes | Path to the CSV |
+| `DnsServer` | No | DNS server IP to query (defaults to system resolver) |
 
+**Status values:** `PASS` · `MISMATCH` (resolves, but wrong IP) · `NO_A_RECORD` · `FAIL`
 
-**Name**: The name of the DNS record.
+---
 
+### Test-PrivateDNSConnectivity.ps1
 
-**Value**: The IP address of the DNS record.
+Tests TCP connectivity to each endpoint's IP on a given port. Use after import to confirm network routing and firewall rules allow traffic.
 
-## Scripts Roadmap
+```powershell
+# Test HTTPS (default port 443)
+.\scripts\Test-PrivateDNSConnectivity.ps1 -CsvPath 'C:\temp\pdns.csv'
 
-1. Add checks for dependencies/pre-requisities
-2. Expand the validate script (Currently tested for storage, sql, synapse, azure backup) - please report any endpoints not validating for enhancements
-3. Backup and export of Azure Private DNS Zones
+# Test SQL (port 1433) with extended timeout
+.\scripts\Test-PrivateDNSConnectivity.ps1 -CsvPath 'C:\temp\pdns.csv' -Port 1433 -TimeoutMs 5000
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `CsvPath` | Yes | Path to the CSV |
+| `Port` | No | TCP port to test (default: 443) |
+| `TimeoutMs` | No | Connection timeout in ms (default: 2000) |
+
+**Status values:** `REACHABLE` · `UNREACHABLE`
+
+---
+
+### Create-PrivateEndpointRoutes.ps1
+
+Enumerates all Private DNS A records and creates a corresponding /32 host route in an Azure Route Table for each endpoint, directing traffic to a next-hop IP (firewall or NVA). Idempotent — skips routes that already exist.
+
+Intended to run on a schedule (e.g. daily Azure Automation runbook) to keep the Route Table current as new endpoints are provisioned.
+
+```powershell
+.\scripts\Create-PrivateEndpointRoutes.ps1 `
+    -SubscriptionId '00000000-0000-0000-0000-000000000000' `
+    -RouteTableResourceGroupName 'rg-networking' `
+    -RouteTableName 'rt-hub' `
+    -NextHopIpAddress '10.0.0.4'
+```
+
+| Parameter | Required | Description |
+|---|---|---|
+| `SubscriptionId` | Yes | Azure subscription to enumerate endpoints from |
+| `RouteTableResourceGroupName` | Yes | Resource group of the Route Table |
+| `RouteTableName` | Yes | Name of the Route Table to update |
+| `NextHopIpAddress` | Yes | Next-hop IP (firewall or NVA) |
+
+Supports `-WhatIf` to preview changes without applying them.
+
+## Typical workflow
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Azure
+    participant CSV
+    participant OnPremDNS
+
+    Admin->>Azure: Connect-AzAccount
+    Admin->>Azure: Export-PrivateDNSRecords
+    Azure-->>CSV: pdns.csv (Zone, Name, IP)
+    Admin->>OnPremDNS: Import-PrivateDNSRecords
+    OnPremDNS-->>Admin: Created N zones, M records
+    Admin->>OnPremDNS: Validate-PrivateDNSRecords
+    OnPremDNS-->>Admin: PASS / MISMATCH report
+    Admin->>Azure: Test-PrivateDNSConnectivity
+    Azure-->>Admin: REACHABLE / UNREACHABLE report
+```
+
+## CI
+
+Pull requests are linted with [PSScriptAnalyzer](https://github.com/PowerShell/PSScriptAnalyzer) via GitHub Actions — see `.github/workflows/lint.yml`.

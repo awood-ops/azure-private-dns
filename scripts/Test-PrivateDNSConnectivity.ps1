@@ -1,35 +1,69 @@
-#usage
-#.\Test-PrivateDNSConnectivity.ps1 -csvPath "c:\temp\pdns.csv"
+<#
+.SYNOPSIS
+    Tests TCP connectivity to each Private DNS endpoint listed in a CSV.
 
-param
-(
-    [Parameter(Mandatory = $true)]
-    [string]$csvPath
+.DESCRIPTION
+    Reads the CSV produced by Export-PrivateDNSRecords.ps1 and tests TCP connectivity
+    to each endpoint's IP address on port 443 (HTTPS). Useful for verifying that
+    network routing and firewall rules allow traffic to private endpoints.
+
+.PARAMETER CsvPath
+    Path to the CSV file produced by Export-PrivateDNSRecords.ps1.
+
+.PARAMETER Port
+    TCP port to test connectivity on. Defaults to 443.
+
+.PARAMETER TimeoutMs
+    Connection timeout in milliseconds. Defaults to 2000.
+
+.EXAMPLE
+    .\Test-PrivateDNSConnectivity.ps1 -CsvPath 'C:\temp\pdns.csv'
+
+.EXAMPLE
+    .\Test-PrivateDNSConnectivity.ps1 -CsvPath 'C:\temp\pdns.csv' -Port 1433 -TimeoutMs 5000
+#>
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)]
+    [ValidateScript({ Test-Path $_ })]
+    [string] $CsvPath,
+
+    [int] $Port = 443,
+
+    [int] $TimeoutMs = 2000
 )
 
-# Import the CSV
-Write-output "Importing CSV"
-$csv = Import-Csv -Path $csvPath
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
 
-# Check the DNS Records from CSV and put them into a table
-Write-Output "Testing Endpoint Connectivity"
+Write-Verbose "Importing records from '$CsvPath'..."
+$records = Import-Csv -Path $CsvPath
 
-foreach ($record in $csv)
-{
-    $recordName = $record.Name
-    $recordZone = $record.Zone
+$results = foreach ($record in $records) {
+    $ip   = $record.Value
+    $zone = $record.Zone
+    $name = $record.Name
+    $fqdn = '{0}.{1}' -f $name, ($zone -replace '^privatelink\.', '')
 
-    # Remove the privatelink. prefix from the zone
-    if ($recordZone -eq "privatelink.vaultcore.azure.net") {
-        $recordZone = "vault.azure.net"
-    } elseif ($recordZone -ne "privatelink.adf.azure.com" -and $recordZone -ne "privatelink.purviewstudio.azure.com" -and $recordName -notlike "*ab-pod01*") {
-        $recordZone = $recordZone.Replace("privatelink.", "")
+    $connected = $false
+    try {
+        $tcp = [System.Net.Sockets.TcpClient]::new()
+        $task = $tcp.ConnectAsync($ip, $Port)
+        $connected = $task.Wait($TimeoutMs) -and $tcp.Connected
+        $tcp.Close()
     }
+    catch { }
 
-    if ($recordZone -eq "privatelink.database.windows.net") {
-        Test-NetConnection -ComputerName "$recordName.$recordZone" -Port 1433
-    } else {
-        Test-NetConnection -ComputerName "$recordName.$recordZone" -Port 443
+    [PSCustomObject]@{
+        Status = if ($connected) { 'REACHABLE' } else { 'UNREACHABLE' }
+        FQDN   = $fqdn
+        IP     = $ip
+        Port   = $Port
     }
 }
 
+$results | Format-Table -AutoSize
+
+$ok   = ($results | Where-Object Status -eq 'REACHABLE').Count
+$fail = ($results | Where-Object Status -eq 'UNREACHABLE').Count
+Write-Host "`nResults — Reachable: $ok  Unreachable: $fail  Total: $($results.Count)"
