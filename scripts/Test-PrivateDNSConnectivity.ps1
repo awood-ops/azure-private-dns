@@ -52,7 +52,9 @@ $results = foreach ($record in $records) {
         $connected = $task.Wait($TimeoutMs) -and $tcp.Connected
         $tcp.Close()
     }
-    catch { }
+    catch {
+        $connected = $false
+    }
 
     [PSCustomObject]@{
         Status = if ($connected) { 'REACHABLE' } else { 'UNREACHABLE' }
